@@ -32,8 +32,8 @@ Créez une nouvelle machine virtuelle (Debian ou Ubuntu Server recommandés) ave
 
 * **Ressources :** 1 à 2 Go de RAM, 1 à 2 cœurs CPU, 10 Go de disque.
 * **Réseau (Important) :** La VM doit posséder **deux cartes réseau**.
-* `net0` (WAN) : Connectée au pont principal ayant accès à internet (généralement `vmbr0`).
-* `net1` (LAN) : Connectée à votre pont isolé (ex: `vmbr1`).
+  * `net0` (WAN) : Connectée au pont principal ayant accès à internet (généralement `vmbr0`).
+  * `net1` (LAN) : Connectée à votre pont isolé (ex: `vmbr1`).
 
 
 
