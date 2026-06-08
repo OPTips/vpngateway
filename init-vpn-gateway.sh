@@ -78,7 +78,7 @@ if [[ $ENDPOINT_HOST =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
 else
     echo "Domain detected ($ENDPOINT_HOST). Resolving to IP..."
     VPN_SERVER_IP=$(getent ahosts "$ENDPOINT_HOST" | awk '{ print $1 }' | head -n 1)
-    
+
     if [ -z "$VPN_SERVER_IP" ]; then
         echo "Error: Could not resolve domain $ENDPOINT_HOST"
         rm /tmp/wg-temp.conf
@@ -233,60 +233,52 @@ rm -rf /var/log/installer/* 2>/dev/null || true
 # Clear downloaded packages cache
 apt-get clean
 
-# 11. Create the universal IP update helper script
-echo "Creating the update-vpn-ip helper script..."
-cat << 'EOF' > /usr/local/bin/update-vpn-ip
-#!/bin/bash
+# 11. Lock down post-installation access (immutable/disposable VM)
+echo "Locking down interactive access..."
 
-if [ -z "$1" ]; then
-    echo "Usage: $0 <new_ip_address>"
-    exit 1
-fi
+# Disable and mask the SSH daemon so no remote shell remains
+systemctl disable ssh 2>/dev/null || true
+systemctl mask ssh 2>/dev/null || true
 
-NEW_IP=$1
+# Lock the root password
+passwd -l root 2>/dev/null || true
 
-if ! [[ $NEW_IP =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-    echo "Error: Invalid IP address format."
-    exit 1
-fi
+# Lock every sudo-group account's password
+for u in $(getent group sudo | cut -d: -f4 | tr ',' ' '); do
+    [ -n "$u" ] && passwd -l "$u" 2>/dev/null || true
+done
 
-WG_CONF="/etc/wireguard/wg0.conf"
-IPTABLES_CONF="/etc/iptables/rules.v4"
-
-# Dynamically find the old IP regardless of the port
-OLD_ENDPOINT=$(grep -i '^Endpoint' $WG_CONF | awk -F '=' '{print $2}' | tr -d ' ')
-OLD_IP=$(echo "$OLD_ENDPOINT" | sed 's/:.*//')
-
-if [ -z "$OLD_IP" ]; then
-    echo "Error: Could not find the old IP address in $WG_CONF."
-    exit 1
-fi
-
-echo "Replacing old IP ($OLD_IP) with new IP ($NEW_IP)..."
-sed -i "s/$OLD_IP/$NEW_IP/g" $WG_CONF
-sed -i "s/$OLD_IP/$NEW_IP/g" $IPTABLES_CONF
-
-echo "Reloading firewall rules..."
-netfilter-persistent reload
-
-echo "Restarting WireGuard..."
-systemctl restart wg-quick@wg0
-
-echo "Success! The VPN is now routing traffic through $NEW_IP."
-systemctl status wg-quick@wg0 --no-pager
-EOF
-
-chmod +x /usr/local/bin/update-vpn-ip
-
-# 12. Enable services to start on boot
+# 12. Enable services to start on boot (done BEFORE detaching the finalizer)
 echo "Enabling services..."
 systemctl enable wg-quick@wg0
 systemctl enable netfilter-persistent
 systemctl enable dnsmasq
 
+# 13. Detached in-RAM finalizer: remove the primary user, then reboot.
+# Code is passed inline to bash (never written to disk) and detached via setsid,
+# so killing the SSH session does NOT abort it. The reboot wipes the volatile journal.
 echo "=== Initialization complete! ==="
-echo "The system will now reboot to cleanly apply all rules and clear RAM."
-echo "Your SSH session will be disconnected."
+echo "SSH is now disabled. The only remaining access is the Proxmox console."
+echo "Finalizing in the background (user removal + reboot); your session will drop."
 
-# 13. Reboot the system
-reboot
+setsid bash -c '
+  sleep 5
+  # Remove every human account (UID >= UID_MIN and < nobody), keeping root and
+  # system accounts (UID < 1000) untouched. Derive UID_MIN from login.defs, default 1000.
+  UID_MIN=$(awk "/^UID_MIN/ {print \$2}" /etc/login.defs 2>/dev/null)
+  [ -z "$UID_MIN" ] && UID_MIN=1000
+  while IFS=: read -r uname _ uid _; do
+    if [ "$uid" -ge "$UID_MIN" ] && [ "$uid" -lt 65534 ]; then
+      pkill -KILL -u "$uname" 2>/dev/null
+    fi
+  done < /etc/passwd
+  sleep 2
+  while IFS=: read -r uname _ uid _; do
+    if [ "$uid" -ge "$UID_MIN" ] && [ "$uid" -lt 65534 ]; then
+      deluser --remove-home "$uname" 2>/dev/null
+    fi
+  done < /etc/passwd
+  reboot
+' >/dev/null 2>&1 < /dev/null &
+
+exit 0
