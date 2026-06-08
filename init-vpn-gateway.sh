@@ -50,10 +50,10 @@ fi
 # 4. Extract universal variables (Endpoint, Port, DNS)
 echo "Analyzing pasted configuration..."
 
-# Extract DNS (Take the first one if multiple are provided)
-DNS_SERVER=$(grep -i '^DNS' /tmp/wg-temp.conf | awk -F '=' '{print $2}' | tr -d ' ' | cut -d ',' -f 1)
+# Extract DNS (Take the first IPv4 one; ignore IPv6 entries for an IPv4-only LAN)
+DNS_SERVER=$(grep -i '^DNS' /tmp/wg-temp.conf | awk -F '=' '{print $2}' | tr ',' '\n' | tr -d ' ' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1)
 if [ -z "$DNS_SERVER" ]; then
-    echo "Warning: No DNS found in config. Using Cloudflare (1.1.1.1) as fallback."
+    echo "Warning: No IPv4 DNS found in config. Using Cloudflare (1.1.1.1) as fallback."
     DNS_SERVER="1.1.1.1"
 else
     echo "Detected DNS Server: $DNS_SERVER"
@@ -107,15 +107,23 @@ net.ipv4.ip_forward=1
 EOF
 sysctl -p /etc/sysctl.d/99-vpn-forwarding.conf
 
-# 7. Configure the isolated network interface
+# 7. Configure the isolated network interface (via systemd-networkd, robust)
+# systemd-networkd is present by default on minimal Debian/Ubuntu, unlike the
+# ifupdown stack that /etc/network/interfaces.d relies on.
 echo "Setting up internal network interface ($INT_IF)..."
-cat <<EOF > /etc/network/interfaces.d/$INT_IF
-# Static configuration for the isolated network
-allow-hotplug $INT_IF
-iface $INT_IF inet static
-    address 10.99.0.1
-    netmask 255.255.255.0
+mkdir -p /etc/systemd/network
+cat <<EOF > /etc/systemd/network/10-$INT_IF.network
+[Match]
+Name=$INT_IF
+
+[Network]
+Address=10.99.0.1/24
+# Bring the interface up even with no client connected to the isolated bridge yet
+ConfigureWithoutCarrier=yes
 EOF
+
+# Ensure systemd-networkd is the manager actually bringing the interface up
+systemctl enable systemd-networkd
 
 # 8. Configure dnsmasq for DHCP (Universal DNS + No-Log)
 echo "Configuring DHCP server..."
@@ -124,6 +132,8 @@ if [ -f /etc/dnsmasq.conf ]; then
 fi
 cat <<EOF > /etc/dnsmasq.conf
 interface=$INT_IF
+# bind-dynamic tolerates the interface not being fully ready at start time
+bind-dynamic
 port=0
 dhcp-range=10.99.0.50,10.99.0.150,255.255.255.0,12h
 dhcp-option=3,10.99.0.1
@@ -248,17 +258,18 @@ for u in $(getent group sudo | cut -d: -f4 | tr ',' ' '); do
     [ -n "$u" ] && passwd -l "$u" 2>/dev/null || true
 done
 
-# 12. Enable services to start on boot (done BEFORE detaching the finalizer)
+# 12. Enable services to start on boot
 echo "Enabling services..."
 systemctl enable wg-quick@wg0
 systemctl enable netfilter-persistent
 systemctl enable dnsmasq
 
-# 13. Detached in-RAM finalizer: remove the primary user, then reboot.
+# 13. Detached in-RAM finalizer: remove ALL human accounts, then reboot.
 # Code is passed inline to bash (never written to disk) and detached via setsid,
 # so killing the SSH session does NOT abort it. The reboot wipes the volatile journal.
 echo "=== Initialization complete! ==="
-echo "SSH is now disabled. The only remaining access is the Proxmox console."
+echo "SSH is now disabled. After reboot the VM is a black box (root locked)."
+echo "The system will reboot to cleanly apply all rules and clear RAM."
 echo "Finalizing in the background (user removal + reboot); your session will drop."
 
 setsid bash -c '
